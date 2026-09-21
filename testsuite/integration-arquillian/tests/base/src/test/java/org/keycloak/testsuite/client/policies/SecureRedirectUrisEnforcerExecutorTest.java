@@ -29,6 +29,7 @@ import org.keycloak.client.registration.ClientRegistrationException;
 import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventType;
+import org.keycloak.protocol.oidc.OIDCAdvancedConfigWrapper;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.representations.idm.ClientRepresentation;
 import org.keycloak.representations.idm.RealmRepresentation;
@@ -667,6 +668,69 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         clientRepp = reg.oidc().get(clientId);
         Assertions.assertEquals(List.of("https://oauth.redirect/some"), clientRepp.getRedirectUris());
         Assertions.assertEquals(List.of("https://oauth.redirect/some-post-logout"), clientRepp.getPostLogoutRedirectUris());
+    }
+
+    @Test
+    public void testSecureRedirectUrisEnforcerExecutor_logoutRequestWithPostLogoutRedirectUri() throws Exception {
+        String allowedPostLogoutRedirectUri = oauth.APP_AUTH_ROOT + "?post_logout";
+        String disallowedPostLogoutRedirectUri = "https://app.example.invalid/logout";
+
+        // Create a client before enabling the policy, so that a post-logout redirect uri violating the policy
+        // is registered on the client and passes the standard post_logout_redirect_uri validation of the logout endpoint.
+        String clientId = generateSuffixedName(CLIENT_NAME);
+        createClientByAdmin(clientId, (ClientRepresentation clientRep) -> {
+            clientRep.setSecret("secret");
+            clientRep.setRedirectUris(List.of(oauth.APP_AUTH_ROOT));
+            OIDCAdvancedConfigWrapper.fromClientRepresentation(clientRep)
+                    .setPostLogoutRedirectUris(List.of(allowedPostLogoutRedirectUri, disallowedPostLogoutRedirectUri));
+        });
+
+        // register profiles
+        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
+                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
+                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
+                                createSecureRedirectUrisEnforcerExecutorConfig(it -> {
+                                    it.setAllowIPv4LoopbackAddress(true);
+                                    it.setAllowHttpScheme(true);
+                                    it.setAllowPermittedDomains(List.of("example.com"));
+                                }))
+                        .toRepresentation()
+        ).toString();
+        updateProfiles(json);
+
+        // register policies
+        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
+                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
+                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
+                                createAnyClientConditionConfig())
+                        .addProfile(PROFILE_NAME)
+                        .toRepresentation()
+        ).toString();
+        updatePolicies(json);
+
+        // logout request - fail
+        // post_logout_redirect_uri is registered on the client, but its domain is not permitted by the policy
+        oauth.redirectUri(oauth.APP_AUTH_ROOT);
+        AccessTokenResponse tokenResponse = successfulLogin(clientId, "secret");
+        oauth.logoutForm().idTokenHint(tokenResponse.getIdToken()).postLogoutRedirectUri(disallowedPostLogoutRedirectUri).open();
+        EventAssertion.assertError(events.poll()).type(EventType.LOGOUT_ERROR).clientId(clientId)
+                .error(OAuthErrorException.INVALID_REQUEST)
+                .details(Details.REASON, Details.CLIENT_POLICY_ERROR)
+                .details(Details.CLIENT_POLICY_ERROR, OAuthErrorException.INVALID_REQUEST);
+        errorPage.assertCurrent();
+        assertEquals("Invalid redirect uri", errorPage.getError());
+
+        // the user session is still active
+        AccessTokenResponse refreshResponse = oauth.doRefreshTokenRequest(tokenResponse.getRefreshToken());
+        assertEquals(200, refreshResponse.getStatusCode());
+        events.clear();
+
+        // logout request - success
+        // post_logout_redirect_uri is registered on the client and compliant with the policy
+        oauth.logoutForm().idTokenHint(refreshResponse.getIdToken()).postLogoutRedirectUri(allowedPostLogoutRedirectUri).open();
+        EventAssertion.expectLogoutSuccess(events.poll()).clientId(clientId).sessionId(tokenResponse.getSessionState())
+                .details(Details.REDIRECT_URI, allowedPostLogoutRedirectUri);
+        assertEquals(allowedPostLogoutRedirectUri, driver.getCurrentUrl());
     }
 
     @Test
